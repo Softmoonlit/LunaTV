@@ -1,4 +1,8 @@
+[build]
+  publish = "dist"
+  functions = "functions"
+
 [[redirects]]
   from = "/*"
-  to = "/"
+  to = "/index.html"
   status = 200
