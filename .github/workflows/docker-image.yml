@@ -3,10 +3,9 @@ name: Build & Push Docker image
 on:
   workflow_dispatch:
   push:
-    branches:
-      - '**'
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
   release:
     types: [published]
@@ -49,7 +48,7 @@ jobs:
           push: false
 
   build:
-    if: github.event_name != 'pull_request'
+    if: github.repository == 'Softmoonlit/LunaTV' && github.event_name != 'pull_request'
     permissions:
       contents: read
       packages: write
@@ -65,19 +64,6 @@ jobs:
     steps:
       - name: Prepare platform name
         run: echo "PLATFORM_NAME=${{ matrix.platform }}" | sed 's|/|-|g' >> "$GITHUB_ENV"
-
-      - name: Determine Docker tag
-        id: docker-tag
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            tag="${{ github.event.release.tag_name }}"
-          elif [ "${{ github.ref_name }}" = "main" ] || [ "${{ github.ref_name }}" = "master" ]; then
-            tag="latest"
-          else
-            tag="sha-${GITHUB_SHA::7}"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -99,8 +85,7 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
-          tags: ${{ env.IMAGE }}:${{ steps.docker-tag.outputs.tag }}
-          outputs: type=image,name=${{ env.IMAGE }},name-canonical=true,push=true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         shell: bash
@@ -118,7 +103,7 @@ jobs:
           retention-days: 1
 
   merge:
-    if: github.event_name != 'pull_request'
+    if: github.repository == 'Softmoonlit/LunaTV' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     needs: [build]
     permissions:
@@ -147,13 +132,21 @@ jobs:
         id: docker-tag
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            tag="${{ github.event.release.tag_name }}"
-          elif [ "${{ github.ref_name }}" = "main" ] || [ "${{ github.ref_name }}" = "master" ]; then
-            tag="latest"
-          else
-            tag="sha-${GITHUB_SHA::7}"
-          fi
+          case "${{ github.event_name }}" in
+            release)
+              tag="${{ github.event.release.tag_name }}"
+              ;;
+            push)
+              tag="latest"
+              ;;
+            workflow_dispatch)
+              tag="sha-${GITHUB_SHA}"
+              ;;
+            *)
+              echo "Unsupported event: ${{ github.event_name }}" >&2
+              exit 1
+              ;;
+          esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Create manifest list and push
