@@ -330,6 +330,7 @@ dockge/komodo 等 docker compose UI 也有自动更新功能
 | NEXT_PUBLIC_SITE_NAME               | 站点名称                                     | 任意字符串                       | MoonTV                                                                                                                     |
 | ANNOUNCEMENT                        | 站点公告                                     | 任意字符串                       | 本网站仅提供影视信息搜索服务，所有内容均来自第三方网站。本站不存储任何视频资源，不对任何内容的准确性、合法性、完整性负责。 |
 | NEXT_PUBLIC_STORAGE_TYPE            | 播放记录/收藏的存储方式                      | redis、kvrocks、upstash | 无默认，必填字段                                                                                                               |
+| NEXT_PUBLIC_ENABLE_REGISTER         | 首次初始化时是否允许新用户注册                | true/false                       | false                                                                                                                        |
 | KVROCKS_URL                           | kvrocks 连接 url                               | 连接 url                         | 空                                                                                                                         |
 | REDIS_URL                           | redis 连接 url                               | 连接 url                         | 空                                                                                                                         |
 | UPSTASH_URL                         | upstash redis 连接 url                       | 连接 url                         | 空                                                                                                                         |
@@ -373,7 +374,9 @@ v100.0.0 以上版本可配合 [Selene](https://github.com/MoonTechLab/Selene) �
 
 ### 请设置密码保护并关闭公网注册
 
-为了您的安全和避免潜在的法律风险，我们要求在部署时**强烈建议关闭公网注册**：
+为了您的安全和避免潜在的法律风险，我们要求在部署时**强烈建议关闭公网注册**。公网注册默认关闭，站长可在后台的“用户配置”中动态开启或关闭；`NEXT_PUBLIC_ENABLE_REGISTER` 仅决定首次初始化配置时的默认值。
+
+如需开放公网注册，请在反向代理或部署平台对 `/api/register` 配置按 IP 限流，避免接口被批量调用。关闭后台开关后，服务端会立即拒绝新的注册请求，现有用户仍可正常登录。
 
 ### 部署要求
 

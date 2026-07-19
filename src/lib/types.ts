@@ -1,5 +1,12 @@
 import { AdminConfig } from './admin.types';
 
+export class UserAlreadyExistsError extends Error {
+  constructor() {
+    super('用户已存在');
+    this.name = 'UserAlreadyExistsError';
+  }
+}
+
 // 播放记录数据结构
 export interface PlayRecord {
   title: string;

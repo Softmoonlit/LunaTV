@@ -19,6 +19,7 @@ export interface AdminConfig {
     EnableWebLive: boolean;
   };
   UserConfig: {
+    AllowRegister: boolean;
     Users: {
       username: string;
       role: 'user' | 'admin' | 'owner';

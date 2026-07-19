@@ -15,6 +15,7 @@ const ACTIONS = [
   'unban',
   'setAdmin',
   'cancelAdmin',
+  'setAllowRegister',
   'changePassword',
   'deleteUser',
   'updateUserApis',
@@ -46,10 +47,12 @@ export async function POST(request: NextRequest) {
     const {
       targetUsername, // 目标用户名
       targetPassword, // 目标用户密码（仅在添加用户时需要）
+      allowRegister,
       action,
     } = body as {
       targetUsername?: string;
       targetPassword?: string;
+      allowRegister?: boolean;
       action?: (typeof ACTIONS)[number];
     };
 
@@ -57,8 +60,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: '参数格式错误' }, { status: 400 });
     }
 
-    // 用户组操作和批量操作不需要targetUsername
-    if (!targetUsername && !['userGroup', 'batchUpdateUserGroups'].includes(action)) {
+    // 用户组、批量操作和注册开关不需要targetUsername
+    if (
+      !targetUsername &&
+      !['userGroup', 'batchUpdateUserGroups', 'setAllowRegister'].includes(action)
+    ) {
       return NextResponse.json({ error: '缺少目标用户名' }, { status: 400 });
     }
 
@@ -116,6 +122,19 @@ export async function POST(request: NextRequest) {
     }
 
     switch (action) {
+      case 'setAllowRegister': {
+        if (operatorRole !== 'owner') {
+          return NextResponse.json(
+            { error: '仅站长可修改注册设置' },
+            { status: 403 }
+          );
+        }
+        if (typeof allowRegister !== 'boolean') {
+          return NextResponse.json({ error: '参数格式错误' }, { status: 400 });
+        }
+        adminConfig.UserConfig.AllowRegister = allowRegister;
+        break;
+      }
       case 'add': {
         if (targetEntry) {
           return NextResponse.json({ error: '用户已存在' }, { status: 400 });

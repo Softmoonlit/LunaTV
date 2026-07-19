@@ -4,7 +4,13 @@ import { Redis } from '@upstash/redis';
 
 import { AdminConfig } from './admin.types';
 import { hashPassword, isHashed, verifyPassword } from './password';
-import { Favorite, IStorage, PlayRecord, SkipConfig } from './types';
+import {
+  Favorite,
+  IStorage,
+  PlayRecord,
+  SkipConfig,
+  UserAlreadyExistsError,
+} from './types';
 
 // 搜索历史最大条数
 const SEARCH_HISTORY_LIMIT = 20;
@@ -161,9 +167,19 @@ export class UpstashRedisStorage implements IStorage {
 
   async registerUser(userName: string, password: string): Promise<void> {
     const hashed = hashPassword(password);
-    await withRetry(() => this.client.set(this.userPwdKey(userName), hashed));
-    // 维护用户集合
-    await withRetry(() => this.client.sadd(this.usersSetKey(), userName));
+    const result = await withRetry(() =>
+      this.client.set(this.userPwdKey(userName), hashed, { nx: true })
+    );
+    if (result !== 'OK') {
+      throw new UserAlreadyExistsError();
+    }
+    try {
+      // 维护用户集合
+      await withRetry(() => this.client.sadd(this.usersSetKey(), userName));
+    } catch (error) {
+      await withRetry(() => this.client.del(this.userPwdKey(userName)));
+      throw error;
+    }
   }
 
   async verifyUser(userName: string, password: string): Promise<boolean> {
