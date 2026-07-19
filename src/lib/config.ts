@@ -221,6 +221,7 @@ async function getInitConfig(configFile: string, subConfig: {
       EnableWebLive: false,
     },
     UserConfig: {
+      AllowRegister: process.env.NEXT_PUBLIC_ENABLE_REGISTER === 'true',
       Users: [],
     },
     SourceConfig: [],
@@ -317,7 +318,10 @@ export async function getConfig(): Promise<AdminConfig> {
 export function configSelfCheck(adminConfig: AdminConfig): AdminConfig {
   // 确保必要的属性存在和初始化
   if (!adminConfig.UserConfig) {
-    adminConfig.UserConfig = { Users: [] };
+    adminConfig.UserConfig = { AllowRegister: false, Users: [] };
+  }
+  if (typeof adminConfig.UserConfig.AllowRegister !== 'boolean') {
+    adminConfig.UserConfig.AllowRegister = false;
   }
   if (!adminConfig.UserConfig.Users || !Array.isArray(adminConfig.UserConfig.Users)) {
     adminConfig.UserConfig.Users = [];

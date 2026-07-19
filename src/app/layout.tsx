@@ -54,6 +54,7 @@ export default async function RootLayout({
   let disableYellowFilter =
     process.env.NEXT_PUBLIC_DISABLE_YELLOW_FILTER === 'true';
   let fluidSearch = process.env.NEXT_PUBLIC_FLUID_SEARCH !== 'false';
+  let enableRegister = false;
   let enableWebLive = false;
   let customCategories = [] as {
     name: string;
@@ -78,12 +79,14 @@ export default async function RootLayout({
       query: category.query,
     }));
     fluidSearch = config.SiteConfig.FluidSearch;
+    enableRegister = config.UserConfig.AllowRegister;
     enableWebLive = config.SiteConfig.EnableWebLive ?? false;
   }
 
   // 将运行时配置注入到全局 window 对象，供客户端在运行时读取
   const runtimeConfig = {
     STORAGE_TYPE: process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage',
+    ENABLE_REGISTER: enableRegister,
     DOUBAN_PROXY_TYPE: doubanProxyType,
     DOUBAN_PROXY: doubanProxy,
     DOUBAN_IMAGE_PROXY_TYPE: doubanImageProxyType,

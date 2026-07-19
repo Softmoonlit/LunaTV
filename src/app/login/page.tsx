@@ -73,8 +73,11 @@ function LoginPageClient() {
   const [password, setPassword] = useState('');
   const [username, setUsername] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loadingAction, setLoadingAction] = useState<
+    'login' | 'register' | null
+  >(null);
   const [shouldAskUsername, setShouldAskUsername] = useState(false);
+  const [enableRegister, setEnableRegister] = useState(false);
 
   const { siteName } = useSite();
 
@@ -83,6 +86,10 @@ function LoginPageClient() {
     if (typeof window !== 'undefined') {
       const storageType = (window as any).RUNTIME_CONFIG?.STORAGE_TYPE;
       setShouldAskUsername(storageType && storageType !== 'localstorage');
+      setEnableRegister(
+        storageType !== 'localstorage' &&
+          Boolean((window as any).RUNTIME_CONFIG?.ENABLE_REGISTER)
+      );
     }
   }, []);
 
@@ -93,7 +100,7 @@ function LoginPageClient() {
     if (!password || (shouldAskUsername && !username)) return;
 
     try {
-      setLoading(true);
+      setLoadingAction('login');
       const res = await fetch('/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -115,7 +122,33 @@ function LoginPageClient() {
     } catch (error) {
       setError('网络错误，请稍后重试');
     } finally {
-      setLoading(false);
+      setLoadingAction(null);
+    }
+  };
+
+  const handleRegister = async () => {
+    setError(null);
+    if (!password || !username) return;
+
+    try {
+      setLoadingAction('register');
+      const res = await fetch('/api/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+
+      if (res.ok) {
+        const redirect = searchParams.get('redirect') || '/';
+        router.replace(redirect);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setError(data.error ?? '服务器错误');
+      }
+    } catch (error) {
+      setError('网络错误，请稍后重试');
+    } finally {
+      setLoadingAction(null);
     }
   };
 
@@ -167,16 +200,41 @@ function LoginPageClient() {
             <p className='text-sm text-red-600 dark:text-red-400'>{error}</p>
           )}
 
-          {/* 登录按钮 */}
-          <button
-            type='submit'
-            disabled={
-              !password || loading || (shouldAskUsername && !username)
-            }
-            className='inline-flex w-full justify-center rounded-lg bg-green-600 py-3 text-base font-semibold text-white shadow-lg transition-all duration-200 hover:from-green-600 hover:to-blue-600 disabled:cursor-not-allowed disabled:opacity-50'
-          >
-            {loading ? '登录中...' : '登录'}
-          </button>
+          {enableRegister ? (
+            <div className='grid grid-cols-2 gap-4'>
+              <button
+                type='button'
+                onClick={handleRegister}
+                disabled={!password || !username || loadingAction !== null}
+                className='inline-flex justify-center rounded-lg bg-blue-600 py-3 text-base font-semibold text-white shadow-lg transition-colors duration-200 hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50'
+              >
+                {loadingAction === 'register' ? '注册中...' : '注册'}
+              </button>
+              <button
+                type='submit'
+                disabled={
+                  !password ||
+                  !username ||
+                  loadingAction !== null
+                }
+                className='inline-flex justify-center rounded-lg bg-green-600 py-3 text-base font-semibold text-white shadow-lg transition-colors duration-200 hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-50'
+              >
+                {loadingAction === 'login' ? '登录中...' : '登录'}
+              </button>
+            </div>
+          ) : (
+            <button
+              type='submit'
+              disabled={
+                !password ||
+                loadingAction !== null ||
+                (shouldAskUsername && !username)
+              }
+              className='inline-flex w-full justify-center rounded-lg bg-green-600 py-3 text-base font-semibold text-white shadow-lg transition-colors duration-200 hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-50'
+            >
+              {loadingAction === 'login' ? '登录中...' : '登录'}
+            </button>
+          )}
         </form>
       </div>
 

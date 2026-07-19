@@ -349,6 +349,9 @@ interface UserConfigProps {
 const UserConfig = ({ config, role, refreshConfig }: UserConfigProps) => {
   const { alertModal, showAlert, hideAlert } = useAlertModal();
   const { isLoading, withLoading } = useLoadingState();
+  const [allowRegister, setAllowRegister] = useState(
+    config?.UserConfig.AllowRegister ?? false
+  );
   const [showAddUserForm, setShowAddUserForm] = useState(false);
   const [showChangePasswordForm, setShowChangePasswordForm] = useState(false);
   const [showAddUserGroupForm, setShowAddUserGroupForm] = useState(false);
@@ -398,6 +401,36 @@ const UserConfig = ({ config, role, refreshConfig }: UserConfigProps) => {
 
   // 当前登录用户名
   const currentUsername = getAuthInfoFromBrowserCookie()?.username || null;
+
+  useEffect(() => {
+    setAllowRegister(config?.UserConfig.AllowRegister ?? false);
+  }, [config?.UserConfig.AllowRegister]);
+
+  const toggleAllowRegister = async (value: boolean) => {
+    const previousValue = allowRegister;
+    setAllowRegister(value);
+
+    try {
+      const res = await fetch('/api/admin/user', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'setAllowRegister',
+          allowRegister: value,
+        }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `操作失败: ${res.status}`);
+      }
+
+      await refreshConfig();
+    } catch (err) {
+      setAllowRegister(previousValue);
+      showError(err instanceof Error ? err.message : '操作失败', showAlert);
+    }
+  };
 
   // 使用 useMemo 计算全选状态，避免每次渲染都重新计算
   const selectAllUsers = useMemo(() => {
@@ -795,6 +828,39 @@ const UserConfig = ({ config, role, refreshConfig }: UserConfigProps) => {
       </div>
 
 
+
+      {role === 'owner' && (
+        <div>
+          <h4 className='text-sm font-medium text-gray-700 dark:text-gray-300 mb-3'>
+            注册设置
+          </h4>
+          <div className='flex items-center justify-between'>
+            <label
+              htmlFor='allow-register'
+              className='text-sm text-gray-700 dark:text-gray-300'
+            >
+              允许新用户注册
+            </label>
+            <button
+              id='allow-register'
+              type='button'
+              role='switch'
+              aria-checked={allowRegister}
+              aria-label='允许新用户注册'
+              onClick={() => toggleAllowRegister(!allowRegister)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 ${
+                allowRegister ? 'bg-green-600' : 'bg-gray-200 dark:bg-gray-700'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  allowRegister ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* 用户组管理 */}
       <div>

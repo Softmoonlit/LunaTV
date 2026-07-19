@@ -4,7 +4,13 @@ import { createClient, RedisClientType } from 'redis';
 
 import { AdminConfig } from './admin.types';
 import { hashPassword, isHashed, verifyPassword } from './password';
-import { Favorite, IStorage, PlayRecord, SkipConfig } from './types';
+import {
+  Favorite,
+  IStorage,
+  PlayRecord,
+  SkipConfig,
+  UserAlreadyExistsError,
+} from './types';
 
 // 搜索历史最大条数
 const SEARCH_HISTORY_LIMIT = 20;
@@ -253,9 +259,19 @@ export abstract class BaseRedisStorage implements IStorage {
 
   async registerUser(userName: string, password: string): Promise<void> {
     const hashed = hashPassword(password);
-    await this.withRetry(() => this.client.set(this.userPwdKey(userName), hashed));
-    // 维护用户集合
-    await this.withRetry(() => this.client.sAdd(this.usersSetKey(), userName));
+    const result = await this.withRetry(() =>
+      this.client.set(this.userPwdKey(userName), hashed, { NX: true })
+    );
+    if (result !== 'OK') {
+      throw new UserAlreadyExistsError();
+    }
+    try {
+      // 维护用户集合
+      await this.withRetry(() => this.client.sAdd(this.usersSetKey(), userName));
+    } catch (error) {
+      await this.withRetry(() => this.client.del(this.userPwdKey(userName)));
+      throw error;
+    }
   }
 
   async verifyUser(userName: string, password: string): Promise<boolean> {
