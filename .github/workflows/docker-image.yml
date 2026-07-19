@@ -128,10 +128,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine Docker tag
-        id: docker-tag
+      - name: Determine Docker tags
+        id: docker-tags
         shell: bash
         run: |
+          additional_tag=""
           case "${{ github.event_name }}" in
             release)
               tag="${{ github.event.release.tag_name }}"
@@ -140,7 +141,10 @@ jobs:
               tag="latest"
               ;;
             workflow_dispatch)
-              tag="sha-${GITHUB_SHA}"
+              tag="sha-${GITHUB_SHA::7}"
+              if [ "${{ github.ref_name }}" = "dev/concurrency-consistency" ]; then
+                additional_tag="dev"
+              fi
               ;;
             *)
               echo "Unsupported event: ${{ github.event_name }}" >&2
@@ -148,10 +152,15 @@ jobs:
               ;;
           esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "additional_tag=$additional_tag" >> "$GITHUB_OUTPUT"
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
         shell: bash
         run: |
-          docker buildx imagetools create -t "${IMAGE}:${{ steps.docker-tag.outputs.tag }}" \
+          tags=(-t "${IMAGE}:${{ steps.docker-tags.outputs.tag }}")
+          if [ -n "${{ steps.docker-tags.outputs.additional_tag }}" ]; then
+            tags+=(-t "${IMAGE}:${{ steps.docker-tags.outputs.additional_tag }}")
+          fi
+          docker buildx imagetools create "${tags[@]}" \
             $(printf "${IMAGE}@sha256:%s " *)
