@@ -2,8 +2,16 @@
 
 import { AdminConfig } from './admin.types';
 import { KvrocksStorage } from './kvrocks.db';
+import { hashPassword } from './password';
 import { RedisStorage } from './redis.db';
-import { Favorite, IStorage, PlayRecord, SkipConfig } from './types';
+import {
+  AtomicRegistrationInput,
+  AtomicRegistrationResult,
+  Favorite,
+  IStorage,
+  PlayRecord,
+  SkipConfig,
+} from './types';
 import { UpstashRedisStorage } from './upstash.db';
 
 // storage type 常量: 'localstorage' | 'redis' | 'upstash'，默认 'localstorage'
@@ -45,6 +53,19 @@ export function generateStorageKey(source: string, id: string): string {
   return `${source}+${id}`;
 }
 
+type AtomicUserMutationRequest =
+  | {
+      action: 'add' | 'changePassword';
+      username: string;
+      password: string;
+      config: AdminConfig;
+    }
+  | {
+      action: 'delete';
+      username: string;
+      config: AdminConfig;
+    };
+
 // 导出便捷方法
 export class DbManager {
   private storage: IStorage;
@@ -54,14 +75,17 @@ export class DbManager {
     this.storage = getStorage();
     // 启动时自动触发数据迁移（异步，不阻塞构造）
     if (this.storage && typeof this.storage.migrateData === 'function') {
-      this.migrationPromise = this.storage.migrateData().then(async () => {
-        // 数据结构迁移完成后，执行密码哈希迁移
-        if (typeof this.storage.migratePasswords === 'function') {
-          await this.storage.migratePasswords();
-        }
-      }).catch((err) => {
-        console.error('数据迁移异常:', err);
-      });
+      this.migrationPromise = this.storage
+        .migrateData()
+        .then(async () => {
+          // 数据结构迁移完成后，执行密码哈希迁移
+          if (typeof this.storage.migratePasswords === 'function') {
+            await this.storage.migratePasswords();
+          }
+        })
+        .catch((err) => {
+          console.error('数据迁移异常:', err);
+        });
     }
   }
 
@@ -167,6 +191,31 @@ export class DbManager {
     await this.storage.registerUser(userName, password);
   }
 
+  async restoreUserPassword(
+    userName: string,
+    storedPassword: string
+  ): Promise<void> {
+    await this.storage.restoreUserPassword(userName, storedPassword);
+  }
+
+  async registerUserAtomically(
+    input: AtomicRegistrationInput
+  ): Promise<AtomicRegistrationResult> {
+    return this.storage.registerUserAtomically(input);
+  }
+
+  async mutateUserAtomically(
+    input: AtomicUserMutationRequest
+  ): Promise<AdminConfig> {
+    if (input.action === 'delete') {
+      return this.storage.mutateUserAtomically(input);
+    }
+    return this.storage.mutateUserAtomically({
+      ...input,
+      passwordHash: hashPassword(input.password),
+    });
+  }
+
   async verifyUser(userName: string, password: string): Promise<boolean> {
     return this.storage.verifyUser(userName, password);
   }
@@ -207,16 +256,28 @@ export class DbManager {
 
   // ---------- 管理员配置 ----------
   async getAdminConfig(): Promise<AdminConfig | null> {
-    if (typeof (this.storage as any).getAdminConfig === 'function') {
-      return (this.storage as any).getAdminConfig();
-    }
-    return null;
+    if (!this.storage?.getAdminConfig) return null;
+    return this.storage.getAdminConfig();
   }
 
-  async saveAdminConfig(config: AdminConfig): Promise<void> {
-    if (typeof (this.storage as any).setAdminConfig === 'function') {
-      await (this.storage as any).setAdminConfig(config);
-    }
+  async getAdminConfigVersion(): Promise<number> {
+    if (!this.storage?.getAdminConfigVersion) return 0;
+    return this.storage.getAdminConfigVersion();
+  }
+
+  async initializeAdminConfig(config: AdminConfig): Promise<AdminConfig> {
+    if (!this.storage?.initializeAdminConfig) return config;
+    return this.storage.initializeAdminConfig(config);
+  }
+
+  async saveAdminConfig(config: AdminConfig): Promise<AdminConfig> {
+    if (!this.storage?.setAdminConfig) return config;
+    return this.storage.setAdminConfig(config);
+  }
+
+  async replaceAdminConfig(config: AdminConfig): Promise<AdminConfig> {
+    if (!this.storage?.replaceAdminConfig) return config;
+    return this.storage.replaceAdminConfig(config);
   }
 
   // ---------- 跳过片头片尾配置 ----------

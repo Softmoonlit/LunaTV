@@ -1,9 +1,20 @@
 import { AdminConfig } from './admin.types';
-import { configSelfCheck } from './config';
+import { configSelfCheck, getConfig, setCachedConfig } from './config';
+import { db } from './db';
 
 jest.mock('@/lib/db', () => ({
-  db: {},
+  db: {
+    getAdminConfigVersion: jest.fn(),
+    getAdminConfig: jest.fn(),
+  },
 }));
+
+const mockedGetConfigVersion = db.getAdminConfigVersion as jest.MockedFunction<
+  typeof db.getAdminConfigVersion
+>;
+const mockedGetAdminConfig = db.getAdminConfig as jest.MockedFunction<
+  typeof db.getAdminConfig
+>;
 
 function createConfig(allowRegister?: boolean) {
   return {
@@ -39,5 +50,34 @@ describe('configSelfCheck', () => {
     const config = configSelfCheck(createConfig(true));
 
     expect(config.UserConfig.AllowRegister).toBe(true);
+  });
+
+  it('保留已有的配置版本', () => {
+    const input = createConfig(true);
+    input.ConfigVersion = 7;
+
+    const config = configSelfCheck(input);
+
+    expect(config.ConfigVersion).toBe(7);
+  });
+
+  it('配置版本探测失败时返回缓存副本', async () => {
+    process.env.NEXT_PUBLIC_STORAGE_TYPE = 'redis';
+    const cached = createConfig(true);
+    cached.ConfigVersion = 9;
+    await setCachedConfig(cached);
+    mockedGetConfigVersion.mockRejectedValueOnce(new Error('存储暂时不可用'));
+    const consoleError = jest.spyOn(console, 'error').mockImplementation();
+
+    const result = await getConfig();
+
+    expect(result).toEqual(cached);
+    expect(result).not.toBe(cached);
+    expect(mockedGetAdminConfig).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledWith(
+      '获取配置版本失败:',
+      expect.any(Error)
+    );
+    consoleError.mockRestore();
   });
 });

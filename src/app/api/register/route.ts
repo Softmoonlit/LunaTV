@@ -1,11 +1,12 @@
 /* eslint-disable no-console */
 
+import { createHmac, randomUUID } from 'crypto';
 import { NextRequest, NextResponse } from 'next/server';
 
 import { generateAuthCookie } from '@/lib/auth-cookie';
-import { getConfig } from '@/lib/config';
+import { setCachedConfig } from '@/lib/config';
 import { db } from '@/lib/db';
-import { UserAlreadyExistsError } from '@/lib/types';
+import { hashPassword } from '@/lib/password';
 
 export const runtime = 'nodejs';
 
@@ -14,6 +15,8 @@ const USERNAME_MIN_LENGTH = 3;
 const USERNAME_MAX_LENGTH = 32;
 const PASSWORD_MIN_LENGTH = 6;
 const PASSWORD_MAX_LENGTH = 128;
+const IDEMPOTENCY_KEY_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function validateCredentials(username: unknown, password: unknown) {
   if (typeof username !== 'string' || !username.trim()) {
@@ -50,11 +53,6 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const config = await getConfig();
-    if (!config.UserConfig.AllowRegister) {
-      return NextResponse.json({ error: '当前未开放注册' }, { status: 403 });
-    }
-
     const contentLength = Number(request.headers.get('content-length') || 0);
     if (contentLength > 1024) {
       return NextResponse.json({ error: '请求内容过大' }, { status: 413 });
@@ -73,39 +71,45 @@ export async function POST(request: NextRequest) {
     }
 
     const { username, password } = credentials;
+    const providedOperationId = request.headers.get('idempotency-key');
     if (
-      username === process.env.USERNAME ||
-      config.UserConfig.Users.some((user) => user.username === username) ||
-      (await db.checkUserExist(username))
+      providedOperationId &&
+      !IDEMPOTENCY_KEY_PATTERN.test(providedOperationId)
     ) {
+      return NextResponse.json({ error: '幂等键格式错误' }, { status: 400 });
+    }
+
+    const operationId = providedOperationId || randomUUID();
+    const ownerUsername = process.env.USERNAME || '';
+    const requestFingerprint = createHmac(
+      'sha256',
+      process.env.PASSWORD || 'lunatv-registration'
+    )
+      .update(`${username}\0${password}`)
+      .digest('hex');
+
+    const result = await db.registerUserAtomically({
+      username,
+      passwordHash: hashPassword(password),
+      ownerUsername,
+      operationId,
+      requestFingerprint,
+    });
+
+    if (result.outcome === 'registration_disabled') {
+      return NextResponse.json({ error: '当前未开放注册' }, { status: 403 });
+    }
+    if (result.outcome === 'already_exists') {
       return NextResponse.json({ error: '用户已存在' }, { status: 409 });
     }
-
-    try {
-      await db.registerUser(username, password);
-    } catch (error) {
-      if (error instanceof UserAlreadyExistsError) {
-        return NextResponse.json({ error: '用户已存在' }, { status: 409 });
-      }
-      throw error;
-    }
-
-    const newUser = { username, role: 'user' as const };
-    config.UserConfig.Users.push(newUser);
-
-    try {
-      await db.saveAdminConfig(config);
-    } catch (error) {
-      config.UserConfig.Users = config.UserConfig.Users.filter(
-        (user) => user !== newUser
+    if (result.outcome === 'idempotency_conflict') {
+      return NextResponse.json(
+        { error: '幂等键已用于其他请求' },
+        { status: 409 }
       );
-      try {
-        await db.deleteUser(username);
-      } catch (rollbackError) {
-        console.error('注册失败后回滚用户数据失败:', rollbackError);
-      }
-      throw error;
     }
+
+    await setCachedConfig(result.config);
 
     const response = NextResponse.json({ ok: true });
     const cookieValue = await generateAuthCookie(username, password, 'user');
@@ -123,6 +127,9 @@ export async function POST(request: NextRequest) {
     return response;
   } catch (error) {
     console.error('注册接口异常:', error);
-    return NextResponse.json({ error: '服务器错误' }, { status: 500 });
+    return NextResponse.json(
+      { error: '注册状态暂时无法确认，请使用相同信息重试' },
+      { status: 503 }
+    );
   }
 }

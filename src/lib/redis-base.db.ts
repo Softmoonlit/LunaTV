@@ -1,10 +1,27 @@
 /* eslint-disable no-console, @typescript-eslint/no-explicit-any, @typescript-eslint/no-non-null-assertion */
 
+import { randomUUID } from 'crypto';
 import { createClient, RedisClientType } from 'redis';
 
 import { AdminConfig } from './admin.types';
 import { hashPassword, isHashed, verifyPassword } from './password';
 import {
+  ADMIN_CONFIG_KEY,
+  ADMIN_CONFIG_VERSION_KEY,
+  INITIALIZE_ADMIN_CONFIG_SCRIPT,
+  MIGRATE_PASSWORD_SCRIPT,
+  MUTATE_USER_SCRIPT,
+  REGISTER_USER_SCRIPT,
+  REPLACE_ADMIN_CONFIG_SCRIPT,
+  RESTORE_USER_PASSWORD_SCRIPT,
+  SET_ADMIN_CONFIG_SCRIPT,
+  USERS_SET_KEY,
+} from './storage-scripts';
+import {
+  AtomicRegistrationInput,
+  AtomicRegistrationResult,
+  AtomicUserMutationInput,
+  ConfigConflictError,
   Favorite,
   IStorage,
   PlayRecord,
@@ -24,6 +41,27 @@ function ensureStringArray(value: any[]): string[] {
   return value.map((item) => String(item));
 }
 
+function parseRegistrationResult(value: any):
+  | Exclude<AtomicRegistrationResult, { outcome: 'created' }>
+  | {
+      outcome: 'created';
+      replayed: boolean;
+    } {
+  const result = ensureStringArray(value as any[]);
+  switch (result[0]) {
+    case 'CREATED':
+      return { outcome: 'created', replayed: result[1] === '1' };
+    case 'USER_EXISTS':
+      return { outcome: 'already_exists' };
+    case 'REGISTRATION_DISABLED':
+      return { outcome: 'registration_disabled' };
+    case 'IDEMPOTENCY_CONFLICT':
+      return { outcome: 'idempotency_conflict' };
+    default:
+      throw new Error(`原子注册失败: ${result[0] || 'UNKNOWN'}`);
+  }
+}
+
 // 连接配置接口
 export interface RedisConnectionConfig {
   url: string;
@@ -31,7 +69,10 @@ export interface RedisConnectionConfig {
 }
 
 // 添加Redis操作重试包装器
-function createRetryWrapper(clientName: string, getClient: () => RedisClientType) {
+function createRetryWrapper(
+  clientName: string,
+  getClient: () => RedisClientType
+) {
   return async function withRetry<T>(
     operation: () => Promise<T>,
     maxRetries = 3
@@ -50,7 +91,9 @@ function createRetryWrapper(clientName: string, getClient: () => RedisClientType
 
         if (isConnectionError && !isLastAttempt) {
           console.log(
-            `${clientName} operation failed, retrying... (${i + 1}/${maxRetries})`
+            `${clientName} operation failed, retrying... (${
+              i + 1
+            }/${maxRetries})`
           );
           console.error('Error:', err.message);
 
@@ -79,7 +122,10 @@ function createRetryWrapper(clientName: string, getClient: () => RedisClientType
 }
 
 // 创建客户端的工厂函数
-export function createRedisClient(config: RedisConnectionConfig, globalSymbol: symbol): RedisClientType {
+export function createRedisClient(
+  config: RedisConnectionConfig,
+  globalSymbol: symbol
+): RedisClientType {
   let client: RedisClientType | undefined = (global as any)[globalSymbol];
 
   if (!client) {
@@ -93,9 +139,13 @@ export function createRedisClient(config: RedisConnectionConfig, globalSymbol: s
       socket: {
         // 重连策略：指数退避，最大30秒
         reconnectStrategy: (retries: number) => {
-          console.log(`${config.clientName} reconnection attempt ${retries + 1}`);
+          console.log(
+            `${config.clientName} reconnection attempt ${retries + 1}`
+          );
           if (retries > 10) {
-            console.error(`${config.clientName} max reconnection attempts exceeded`);
+            console.error(
+              `${config.clientName} max reconnection attempts exceeded`
+            );
             return false; // 停止重连
           }
           return Math.min(1000 * Math.pow(2, retries), 30000); // 指数退避，最大30秒
@@ -150,7 +200,10 @@ export function createRedisClient(config: RedisConnectionConfig, globalSymbol: s
 // 抽象基类，包含所有通用的Redis操作逻辑
 export abstract class BaseRedisStorage implements IStorage {
   protected client: RedisClientType;
-  protected withRetry: <T>(operation: () => Promise<T>, maxRetries?: number) => Promise<T>;
+  protected withRetry: <T>(
+    operation: () => Promise<T>,
+    maxRetries?: number
+  ) => Promise<T>;
 
   constructor(config: RedisConnectionConfig, globalSymbol: symbol) {
     this.client = createRedisClient(config, globalSymbol);
@@ -198,9 +251,7 @@ export abstract class BaseRedisStorage implements IStorage {
   }
 
   async deletePlayRecord(userName: string, key: string): Promise<void> {
-    await this.withRetry(() =>
-      this.client.hDel(this.prHashKey(userName), key)
-    );
+    await this.withRetry(() => this.client.hDel(this.prHashKey(userName), key));
   }
 
   async deleteAllPlayRecords(userName: string): Promise<void> {
@@ -267,11 +318,111 @@ export abstract class BaseRedisStorage implements IStorage {
     }
     try {
       // 维护用户集合
-      await this.withRetry(() => this.client.sAdd(this.usersSetKey(), userName));
+      await this.withRetry(() =>
+        this.client.sAdd(this.usersSetKey(), userName)
+      );
     } catch (error) {
       await this.withRetry(() => this.client.del(this.userPwdKey(userName)));
       throw error;
     }
+  }
+
+  async restoreUserPassword(
+    userName: string,
+    storedPassword: string
+  ): Promise<void> {
+    const password = isHashed(storedPassword)
+      ? storedPassword
+      : hashPassword(storedPassword);
+    const operationId = randomUUID();
+    const result = ensureStringArray(
+      (await this.withRetry(() =>
+        this.client.eval(RESTORE_USER_PASSWORD_SCRIPT, {
+          keys: [
+            this.userPwdKey(userName),
+            USERS_SET_KEY,
+            `restore-user:operation:${operationId}`,
+          ],
+          arguments: [password, userName, String(5 * 60)],
+        })
+      )) as any[]
+    );
+    if (result[0] === 'USER_EXISTS') throw new UserAlreadyExistsError();
+    if (result[0] !== 'OK') {
+      throw new Error(`恢复用户密码失败: ${result[0] || 'UNKNOWN'}`);
+    }
+  }
+
+  async registerUserAtomically(
+    input: AtomicRegistrationInput
+  ): Promise<AtomicRegistrationResult> {
+    const result = await this.withRetry(() =>
+      this.client.eval(REGISTER_USER_SCRIPT, {
+        keys: [
+          ADMIN_CONFIG_KEY,
+          ADMIN_CONFIG_VERSION_KEY,
+          this.userPwdKey(input.username),
+          USERS_SET_KEY,
+          `registration:operation:${input.operationId}`,
+        ],
+        arguments: [
+          input.username,
+          input.ownerUsername,
+          input.passwordHash,
+          String(24 * 60 * 60),
+          input.requestFingerprint,
+        ],
+      })
+    );
+    const parsed = parseRegistrationResult(result);
+    if (parsed.outcome !== 'created') return parsed;
+    const config = await this.getAdminConfig();
+    if (!config) throw new Error('注册完成后无法读取配置');
+    return { ...parsed, config };
+  }
+
+  async mutateUserAtomically(
+    input: AtomicUserMutationInput
+  ): Promise<AdminConfig> {
+    const expectedVersion = input.config.ConfigVersion || 0;
+    const nextConfig = {
+      ...input.config,
+      ConfigVersion: expectedVersion + 1,
+    };
+    const operationId = randomUUID();
+    const result = ensureStringArray(
+      (await this.withRetry(() =>
+        this.client.eval(MUTATE_USER_SCRIPT, {
+          keys: [
+            ADMIN_CONFIG_KEY,
+            ADMIN_CONFIG_VERSION_KEY,
+            this.userPwdKey(input.username),
+            USERS_SET_KEY,
+            this.shKey(input.username),
+            this.prHashKey(input.username),
+            this.favHashKey(input.username),
+            this.skipHashKey(input.username),
+            `user:operation:${operationId}`,
+          ],
+          arguments: [
+            String(expectedVersion),
+            JSON.stringify(nextConfig),
+            input.action,
+            input.action === 'delete' ? '' : input.passwordHash,
+            input.username,
+            String(5 * 60),
+          ],
+        })
+      )) as any[]
+    );
+    if (result[0] === 'CONFLICT') throw new ConfigConflictError();
+    if (result[0] === 'USER_EXISTS') throw new UserAlreadyExistsError();
+    if (result[0] !== 'OK') {
+      throw new Error(`用户操作失败: ${result[0] || 'UNKNOWN'}`);
+    }
+    const savedConfig = await this.getAdminConfig();
+    if (!savedConfig) throw new Error('用户操作后无法读取配置');
+    return savedConfig;
   }
 
   async verifyUser(userName: string, password: string): Promise<boolean> {
@@ -284,7 +435,12 @@ export abstract class BaseRedisStorage implements IStorage {
     // 平滑迁移：如果是明文密码且验证通过，自动升级为加盐哈希
     if (ok && !isHashed(storedStr)) {
       const hashed = hashPassword(password);
-      await this.withRetry(() => this.client.set(this.userPwdKey(userName), hashed));
+      await this.withRetry(() =>
+        this.client.eval(MIGRATE_PASSWORD_SCRIPT, {
+          keys: [this.userPwdKey(userName)],
+          arguments: [storedStr, hashed],
+        })
+      );
     }
     return ok;
   }
@@ -347,13 +503,17 @@ export abstract class BaseRedisStorage implements IStorage {
     // 插入到最前
     await this.withRetry(() => this.client.lPush(key, ensureString(keyword)));
     // 限制最大长度
-    await this.withRetry(() => this.client.lTrim(key, 0, SEARCH_HISTORY_LIMIT - 1));
+    await this.withRetry(() =>
+      this.client.lTrim(key, 0, SEARCH_HISTORY_LIMIT - 1)
+    );
   }
 
   async deleteSearchHistory(userName: string, keyword?: string): Promise<void> {
     const key = this.shKey(userName);
     if (keyword) {
-      await this.withRetry(() => this.client.lRem(key, 0, ensureString(keyword)));
+      await this.withRetry(() =>
+        this.client.lRem(key, 0, ensureString(keyword))
+      );
     } else {
       await this.withRetry(() => this.client.del(key));
     }
@@ -361,28 +521,96 @@ export abstract class BaseRedisStorage implements IStorage {
 
   // ---------- 获取全部用户 ----------
   private usersSetKey() {
-    return 'sys:users';
+    return USERS_SET_KEY;
   }
 
   async getAllUsers(): Promise<string[]> {
-    const members = await this.withRetry(() => this.client.sMembers(this.usersSetKey()));
+    const members = await this.withRetry(() =>
+      this.client.sMembers(this.usersSetKey())
+    );
     return ensureStringArray(members as any[]);
   }
 
   // ---------- 管理员配置 ----------
   private adminConfigKey() {
-    return 'admin:config';
+    return ADMIN_CONFIG_KEY;
   }
 
   async getAdminConfig(): Promise<AdminConfig | null> {
-    const val = await this.withRetry(() => this.client.get(this.adminConfigKey()));
+    const val = await this.withRetry(() =>
+      this.client.get(this.adminConfigKey())
+    );
     return val ? (JSON.parse(val) as AdminConfig) : null;
   }
 
-  async setAdminConfig(config: AdminConfig): Promise<void> {
-    await this.withRetry(() =>
-      this.client.set(this.adminConfigKey(), JSON.stringify(config))
+  async getAdminConfigVersion(): Promise<number> {
+    const version = await this.withRetry(() =>
+      this.client.get(ADMIN_CONFIG_VERSION_KEY)
     );
+    if (version !== null) return Number(version) || 0;
+    const config = await this.getAdminConfig();
+    return config?.ConfigVersion || 0;
+  }
+
+  async initializeAdminConfig(config: AdminConfig): Promise<AdminConfig> {
+    const initialConfig = { ...config, ConfigVersion: 1 };
+    await this.withRetry(() =>
+      this.client.eval(INITIALIZE_ADMIN_CONFIG_SCRIPT, {
+        keys: [ADMIN_CONFIG_KEY, ADMIN_CONFIG_VERSION_KEY],
+        arguments: [JSON.stringify(initialConfig)],
+      })
+    );
+    const savedConfig = await this.getAdminConfig();
+    if (!savedConfig) throw new Error('初始化后无法读取配置');
+    return savedConfig;
+  }
+
+  async setAdminConfig(config: AdminConfig): Promise<AdminConfig> {
+    const expectedVersion = config.ConfigVersion || 0;
+    const nextConfig = { ...config, ConfigVersion: expectedVersion + 1 };
+    const operationId = randomUUID();
+    const result = ensureStringArray(
+      (await this.withRetry(() =>
+        this.client.eval(SET_ADMIN_CONFIG_SCRIPT, {
+          keys: [
+            ADMIN_CONFIG_KEY,
+            ADMIN_CONFIG_VERSION_KEY,
+            `config:operation:${operationId}`,
+          ],
+          arguments: [
+            String(expectedVersion),
+            JSON.stringify(nextConfig),
+            String(5 * 60),
+          ],
+        })
+      )) as any[]
+    );
+    if (result[0] === 'CONFLICT' || result[0] === 'MISSING') {
+      throw new ConfigConflictError();
+    }
+    if (result[0] !== 'OK') {
+      throw new Error(`保存配置失败: ${result[0] || 'UNKNOWN'}`);
+    }
+    const savedConfig = await this.getAdminConfig();
+    if (!savedConfig) throw new Error('保存后无法读取配置');
+    return savedConfig;
+  }
+
+  async replaceAdminConfig(config: AdminConfig): Promise<AdminConfig> {
+    const operationId = randomUUID();
+    await this.withRetry(() =>
+      this.client.eval(REPLACE_ADMIN_CONFIG_SCRIPT, {
+        keys: [
+          ADMIN_CONFIG_KEY,
+          ADMIN_CONFIG_VERSION_KEY,
+          `config:operation:${operationId}`,
+        ],
+        arguments: [JSON.stringify(config), String(5 * 60)],
+      })
+    );
+    const savedConfig = await this.getAdminConfig();
+    if (!savedConfig) throw new Error('替换后无法读取配置');
+    return savedConfig;
   }
 
   // ---------- 跳过片头片尾配置 ----------
@@ -452,7 +680,9 @@ export abstract class BaseRedisStorage implements IStorage {
 
   async migrateData(): Promise<void> {
     // 检查是否已迁移
-    const migrated = await this.withRetry(() => this.client.get(this.migrationKey()));
+    const migrated = await this.withRetry(() =>
+      this.client.get(this.migrationKey())
+    );
     if (migrated === 'done') return;
 
     console.log('开始数据迁移：扁平 key → Hash 结构...');
@@ -467,7 +697,9 @@ export abstract class BaseRedisStorage implements IStorage {
         });
 
         if (oldPrKeys.length > 0) {
-          const values = await this.withRetry(() => this.client.mGet(oldPrKeys));
+          const values = await this.withRetry(() =>
+            this.client.mGet(oldPrKeys)
+          );
           for (let i = 0; i < oldPrKeys.length; i++) {
             const raw = values[i];
             if (!raw) continue;
@@ -492,7 +724,9 @@ export abstract class BaseRedisStorage implements IStorage {
         });
 
         if (oldFavKeys.length > 0) {
-          const values = await this.withRetry(() => this.client.mGet(oldFavKeys));
+          const values = await this.withRetry(() =>
+            this.client.mGet(oldFavKeys)
+          );
           for (let i = 0; i < oldFavKeys.length; i++) {
             const raw = values[i];
             if (!raw) continue;
@@ -509,7 +743,9 @@ export abstract class BaseRedisStorage implements IStorage {
       }
 
       // 迁移 skipConfig：u:*:skip:* → u:username:skip (Hash)
-      const skipKeys = await this.withRetry(() => this.client.keys('u:*:skip:*'));
+      const skipKeys = await this.withRetry(() =>
+        this.client.keys('u:*:skip:*')
+      );
       if (skipKeys.length > 0) {
         const oldSkipKeys = skipKeys.filter((k) => {
           const parts = k.split(':');
@@ -517,7 +753,9 @@ export abstract class BaseRedisStorage implements IStorage {
         });
 
         if (oldSkipKeys.length > 0) {
-          const values = await this.withRetry(() => this.client.mGet(oldSkipKeys));
+          const values = await this.withRetry(() =>
+            this.client.mGet(oldSkipKeys)
+          );
           for (let i = 0; i < oldSkipKeys.length; i++) {
             const raw = values[i];
             if (!raw) continue;
@@ -534,7 +772,9 @@ export abstract class BaseRedisStorage implements IStorage {
       }
 
       // 迁移用户列表：从 KEYS u:*:pwd 构建 sys:users Set
-      const userSetExists = await this.withRetry(() => this.client.exists(this.usersSetKey()));
+      const userSetExists = await this.withRetry(() =>
+        this.client.exists(this.usersSetKey())
+      );
       if (!userSetExists) {
         const pwdKeys = await this.withRetry(() => this.client.keys('u:*:pwd'));
         const userNames = pwdKeys
@@ -544,7 +784,9 @@ export abstract class BaseRedisStorage implements IStorage {
           })
           .filter((u): u is string => typeof u === 'string');
         if (userNames.length > 0) {
-          await this.withRetry(() => this.client.sAdd(this.usersSetKey(), userNames));
+          await this.withRetry(() =>
+            this.client.sAdd(this.usersSetKey(), userNames)
+          );
           console.log(`迁移了 ${userNames.length} 个用户到 Set`);
         }
       }
@@ -563,7 +805,9 @@ export abstract class BaseRedisStorage implements IStorage {
   }
 
   async migratePasswords(): Promise<void> {
-    const migrated = await this.withRetry(() => this.client.get(this.pwdMigrationKey()));
+    const migrated = await this.withRetry(() =>
+      this.client.get(this.pwdMigrationKey())
+    );
     if (migrated === 'done') return;
 
     console.log('开始密码迁移：明文 → 加盐哈希...');
@@ -580,11 +824,18 @@ export abstract class BaseRedisStorage implements IStorage {
         if (isHashed(storedStr)) continue;
         // 将明文密码转为加盐哈希
         const hashed = hashPassword(storedStr);
-        await this.withRetry(() => this.client.set(key, hashed));
-        count++;
+        const result = await this.withRetry(() =>
+          this.client.eval(MIGRATE_PASSWORD_SCRIPT, {
+            keys: [key],
+            arguments: [storedStr, hashed],
+          })
+        );
+        if (result === 'UPDATED') count++;
       }
 
-      await this.withRetry(() => this.client.set(this.pwdMigrationKey(), 'done'));
+      await this.withRetry(() =>
+        this.client.set(this.pwdMigrationKey(), 'done')
+      );
       console.log(`密码迁移完成，共迁移 ${count} 个用户`);
     } catch (error) {
       console.error('密码迁移失败:', error);
@@ -602,8 +853,10 @@ export abstract class BaseRedisStorage implements IStorage {
         await this.deleteUser(username);
       }
 
-      // 删除管理员配置
-      await this.withRetry(() => this.client.del(this.adminConfigKey()));
+      // 删除管理员配置及版本
+      await this.withRetry(() =>
+        this.client.del([this.adminConfigKey(), ADMIN_CONFIG_VERSION_KEY])
+      );
 
       console.log('所有数据已清空');
     } catch (error) {

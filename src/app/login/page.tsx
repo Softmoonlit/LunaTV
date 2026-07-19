@@ -4,7 +4,7 @@
 
 import { AlertCircle, CheckCircle } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Suspense, useEffect, useState } from 'react';
+import { Suspense, useEffect, useRef, useState } from 'react';
 
 import { CURRENT_VERSION } from '@/lib/version';
 import { checkForUpdates, UpdateStatus } from '@/lib/version_check';
@@ -42,12 +42,13 @@ function VersionDisplay() {
       <span className='font-mono'>v{CURRENT_VERSION}</span>
       {!isChecking && updateStatus !== UpdateStatus.FETCH_FAILED && (
         <div
-          className={`flex items-center gap-1.5 ${updateStatus === UpdateStatus.HAS_UPDATE
-            ? 'text-yellow-600 dark:text-yellow-400'
-            : updateStatus === UpdateStatus.NO_UPDATE
+          className={`flex items-center gap-1.5 ${
+            updateStatus === UpdateStatus.HAS_UPDATE
+              ? 'text-yellow-600 dark:text-yellow-400'
+              : updateStatus === UpdateStatus.NO_UPDATE
               ? 'text-green-600 dark:text-green-400'
               : ''
-            }`}
+          }`}
         >
           {updateStatus === UpdateStatus.HAS_UPDATE && (
             <>
@@ -78,6 +79,10 @@ function LoginPageClient() {
   >(null);
   const [shouldAskUsername, setShouldAskUsername] = useState(false);
   const [enableRegister, setEnableRegister] = useState(false);
+  const registrationAttempt = useRef<{
+    credentials: string;
+    operationId: string;
+  } | null>(null);
 
   const { siteName } = useSite();
 
@@ -132,13 +137,24 @@ function LoginPageClient() {
 
     try {
       setLoadingAction('register');
+      const credentials = `${username}\0${password}`;
+      if (registrationAttempt.current?.credentials !== credentials) {
+        registrationAttempt.current = {
+          credentials,
+          operationId: crypto.randomUUID(),
+        };
+      }
       const res = await fetch('/api/register', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': registrationAttempt.current.operationId,
+        },
         body: JSON.stringify({ username, password }),
       });
 
       if (res.ok) {
+        registrationAttempt.current = null;
         const redirect = searchParams.get('redirect') || '/';
         router.replace(redirect);
       } else {
@@ -151,8 +167,6 @@ function LoginPageClient() {
       setLoadingAction(null);
     }
   };
-
-
 
   return (
     <div className='relative min-h-screen flex items-center justify-center px-4 overflow-hidden'>
@@ -212,11 +226,7 @@ function LoginPageClient() {
               </button>
               <button
                 type='submit'
-                disabled={
-                  !password ||
-                  !username ||
-                  loadingAction !== null
-                }
+                disabled={!password || !username || loadingAction !== null}
                 className='inline-flex justify-center rounded-lg bg-green-600 py-3 text-base font-semibold text-white shadow-lg transition-colors duration-200 hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-50'
               >
                 {loadingAction === 'login' ? '登录中...' : '登录'}

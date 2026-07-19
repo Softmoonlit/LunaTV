@@ -1,10 +1,27 @@
 /* eslint-disable no-console, @typescript-eslint/no-explicit-any, @typescript-eslint/no-non-null-assertion */
 
 import { Redis } from '@upstash/redis';
+import { randomUUID } from 'crypto';
 
 import { AdminConfig } from './admin.types';
 import { hashPassword, isHashed, verifyPassword } from './password';
 import {
+  ADMIN_CONFIG_KEY,
+  ADMIN_CONFIG_VERSION_KEY,
+  INITIALIZE_ADMIN_CONFIG_SCRIPT,
+  MIGRATE_PASSWORD_SCRIPT,
+  MUTATE_USER_SCRIPT,
+  REGISTER_USER_SCRIPT,
+  REPLACE_ADMIN_CONFIG_SCRIPT,
+  RESTORE_USER_PASSWORD_SCRIPT,
+  SET_ADMIN_CONFIG_SCRIPT,
+  USERS_SET_KEY,
+} from './storage-scripts';
+import {
+  AtomicRegistrationInput,
+  AtomicRegistrationResult,
+  AtomicUserMutationInput,
+  ConfigConflictError,
   Favorite,
   IStorage,
   PlayRecord,
@@ -22,6 +39,27 @@ function ensureString(value: any): string {
 
 function ensureStringArray(value: any[]): string[] {
   return value.map((item) => String(item));
+}
+
+function parseRegistrationResult(value: unknown):
+  | Exclude<AtomicRegistrationResult, { outcome: 'created' }>
+  | {
+      outcome: 'created';
+      replayed: boolean;
+    } {
+  const result = ensureStringArray(value as any[]);
+  switch (result[0]) {
+    case 'CREATED':
+      return { outcome: 'created', replayed: result[1] === '1' };
+    case 'USER_EXISTS':
+      return { outcome: 'already_exists' };
+    case 'REGISTRATION_DISABLED':
+      return { outcome: 'registration_disabled' };
+    case 'IDEMPOTENCY_CONFLICT':
+      return { outcome: 'idempotency_conflict' };
+    default:
+      throw new Error(`原子注册失败: ${result[0] || 'UNKNOWN'}`);
+  }
 }
 
 // 添加Upstash Redis操作重试包装器
@@ -182,6 +220,107 @@ export class UpstashRedisStorage implements IStorage {
     }
   }
 
+  async restoreUserPassword(
+    userName: string,
+    storedPassword: string
+  ): Promise<void> {
+    const password = isHashed(storedPassword)
+      ? storedPassword
+      : hashPassword(storedPassword);
+    const operationId = randomUUID();
+    const result = ensureStringArray(
+      (await withRetry(() =>
+        this.client.eval(
+          RESTORE_USER_PASSWORD_SCRIPT,
+          [
+            this.userPwdKey(userName),
+            USERS_SET_KEY,
+            `restore-user:operation:${operationId}`,
+          ],
+          [password, userName, String(5 * 60)]
+        )
+      )) as any[]
+    );
+    if (result[0] === 'USER_EXISTS') throw new UserAlreadyExistsError();
+    if (result[0] !== 'OK') {
+      throw new Error(`恢复用户密码失败: ${result[0] || 'UNKNOWN'}`);
+    }
+  }
+
+  async registerUserAtomically(
+    input: AtomicRegistrationInput
+  ): Promise<AtomicRegistrationResult> {
+    const result = await withRetry(() =>
+      this.client.eval(
+        REGISTER_USER_SCRIPT,
+        [
+          ADMIN_CONFIG_KEY,
+          ADMIN_CONFIG_VERSION_KEY,
+          this.userPwdKey(input.username),
+          USERS_SET_KEY,
+          `registration:operation:${input.operationId}`,
+        ],
+        [
+          input.username,
+          input.ownerUsername,
+          input.passwordHash,
+          String(24 * 60 * 60),
+          input.requestFingerprint,
+        ]
+      )
+    );
+    const parsed = parseRegistrationResult(result);
+    if (parsed.outcome !== 'created') return parsed;
+    const config = await this.getAdminConfig();
+    if (!config) throw new Error('注册完成后无法读取配置');
+    return { ...parsed, config };
+  }
+
+  async mutateUserAtomically(
+    input: AtomicUserMutationInput
+  ): Promise<AdminConfig> {
+    const expectedVersion = input.config.ConfigVersion || 0;
+    const nextConfig = {
+      ...input.config,
+      ConfigVersion: expectedVersion + 1,
+    };
+    const operationId = randomUUID();
+    const result = ensureStringArray(
+      (await withRetry(() =>
+        this.client.eval(
+          MUTATE_USER_SCRIPT,
+          [
+            ADMIN_CONFIG_KEY,
+            ADMIN_CONFIG_VERSION_KEY,
+            this.userPwdKey(input.username),
+            USERS_SET_KEY,
+            this.shKey(input.username),
+            this.prHashKey(input.username),
+            this.favHashKey(input.username),
+            this.skipHashKey(input.username),
+            `user:operation:${operationId}`,
+          ],
+          [
+            String(expectedVersion),
+            JSON.stringify(nextConfig),
+            input.action,
+            input.action === 'delete' ? '' : input.passwordHash,
+            input.username,
+            String(5 * 60),
+          ]
+        )
+      )) as any[]
+    );
+    if (result[0] === 'CONFLICT') throw new ConfigConflictError();
+    if (result[0] === 'USER_EXISTS') throw new UserAlreadyExistsError();
+    if (result[0] !== 'OK') {
+      throw new Error(`用户操作失败: ${result[0] || 'UNKNOWN'}`);
+    }
+    const savedConfig = await this.getAdminConfig();
+    if (!savedConfig) throw new Error('用户操作后无法读取配置');
+    return savedConfig;
+  }
+
   async verifyUser(userName: string, password: string): Promise<boolean> {
     const stored = await withRetry(() =>
       this.client.get(this.userPwdKey(userName))
@@ -192,7 +331,13 @@ export class UpstashRedisStorage implements IStorage {
     // 平滑迁移：如果是明文密码且验证通过，自动升级为加盐哈希
     if (ok && !isHashed(storedStr)) {
       const hashed = hashPassword(password);
-      await withRetry(() => this.client.set(this.userPwdKey(userName), hashed));
+      await withRetry(() =>
+        this.client.eval(
+          MIGRATE_PASSWORD_SCRIPT,
+          [this.userPwdKey(userName)],
+          [storedStr, hashed]
+        )
+      );
     }
     return ok;
   }
@@ -209,9 +354,7 @@ export class UpstashRedisStorage implements IStorage {
   // 修改用户密码
   async changePassword(userName: string, newPassword: string): Promise<void> {
     const hashed = hashPassword(newPassword);
-    await withRetry(() =>
-      this.client.set(this.userPwdKey(userName), hashed)
-    );
+    await withRetry(() => this.client.set(this.userPwdKey(userName), hashed));
   }
 
   // 删除用户及其所有数据
@@ -269,17 +412,19 @@ export class UpstashRedisStorage implements IStorage {
 
   // ---------- 获取全部用户 ----------
   private usersSetKey() {
-    return 'sys:users';
+    return USERS_SET_KEY;
   }
 
   async getAllUsers(): Promise<string[]> {
-    const members = await withRetry(() => this.client.smembers(this.usersSetKey()));
+    const members = await withRetry(() =>
+      this.client.smembers(this.usersSetKey())
+    );
     return ensureStringArray(members as any[]);
   }
 
   // ---------- 管理员配置 ----------
   private adminConfigKey() {
-    return 'admin:config';
+    return ADMIN_CONFIG_KEY;
   }
 
   async getAdminConfig(): Promise<AdminConfig | null> {
@@ -287,8 +432,73 @@ export class UpstashRedisStorage implements IStorage {
     return val ? (val as AdminConfig) : null;
   }
 
-  async setAdminConfig(config: AdminConfig): Promise<void> {
-    await withRetry(() => this.client.set(this.adminConfigKey(), config));
+  async getAdminConfigVersion(): Promise<number> {
+    const version = await withRetry(() =>
+      this.client.get<number>(ADMIN_CONFIG_VERSION_KEY)
+    );
+    if (version !== null) return Number(version) || 0;
+    const config = await this.getAdminConfig();
+    return config?.ConfigVersion || 0;
+  }
+
+  async initializeAdminConfig(config: AdminConfig): Promise<AdminConfig> {
+    const initialConfig = { ...config, ConfigVersion: 1 };
+    await withRetry(() =>
+      this.client.eval(
+        INITIALIZE_ADMIN_CONFIG_SCRIPT,
+        [ADMIN_CONFIG_KEY, ADMIN_CONFIG_VERSION_KEY],
+        [JSON.stringify(initialConfig)]
+      )
+    );
+    const savedConfig = await this.getAdminConfig();
+    if (!savedConfig) throw new Error('初始化后无法读取配置');
+    return savedConfig;
+  }
+
+  async setAdminConfig(config: AdminConfig): Promise<AdminConfig> {
+    const expectedVersion = config.ConfigVersion || 0;
+    const nextConfig = { ...config, ConfigVersion: expectedVersion + 1 };
+    const operationId = randomUUID();
+    const result = ensureStringArray(
+      (await withRetry(() =>
+        this.client.eval(
+          SET_ADMIN_CONFIG_SCRIPT,
+          [
+            ADMIN_CONFIG_KEY,
+            ADMIN_CONFIG_VERSION_KEY,
+            `config:operation:${operationId}`,
+          ],
+          [String(expectedVersion), JSON.stringify(nextConfig), String(5 * 60)]
+        )
+      )) as any[]
+    );
+    if (result[0] === 'CONFLICT' || result[0] === 'MISSING') {
+      throw new ConfigConflictError();
+    }
+    if (result[0] !== 'OK') {
+      throw new Error(`保存配置失败: ${result[0] || 'UNKNOWN'}`);
+    }
+    const savedConfig = await this.getAdminConfig();
+    if (!savedConfig) throw new Error('保存后无法读取配置');
+    return savedConfig;
+  }
+
+  async replaceAdminConfig(config: AdminConfig): Promise<AdminConfig> {
+    const operationId = randomUUID();
+    await withRetry(() =>
+      this.client.eval(
+        REPLACE_ADMIN_CONFIG_SCRIPT,
+        [
+          ADMIN_CONFIG_KEY,
+          ADMIN_CONFIG_VERSION_KEY,
+          `config:operation:${operationId}`,
+        ],
+        [JSON.stringify(config), String(5 * 60)]
+      )
+    );
+    const savedConfig = await this.getAdminConfig();
+    if (!savedConfig) throw new Error('替换后无法读取配置');
+    return savedConfig;
   }
 
   // ---------- 跳过片头片尾配置 ----------
@@ -357,14 +567,18 @@ export class UpstashRedisStorage implements IStorage {
 
   async migrateData(): Promise<void> {
     // 检查是否已迁移
-    const migrated = await withRetry(() => this.client.get(this.migrationKey()));
+    const migrated = await withRetry(() =>
+      this.client.get(this.migrationKey())
+    );
     if (migrated === 'done') return;
 
     console.log('开始数据迁移：扁平 key → Hash 结构...');
 
     try {
       // 迁移播放记录：u:*:pr:* → u:username:pr (Hash)
-      const prKeys: string[] = await withRetry(() => this.client.keys('u:*:pr:*'));
+      const prKeys: string[] = await withRetry(() =>
+        this.client.keys('u:*:pr:*')
+      );
       if (prKeys.length > 0) {
         const oldPrKeys = prKeys.filter((k) => {
           const parts = k.split(':');
@@ -389,7 +603,9 @@ export class UpstashRedisStorage implements IStorage {
       }
 
       // 迁移收藏：u:*:fav:* → u:username:fav (Hash)
-      const favKeys: string[] = await withRetry(() => this.client.keys('u:*:fav:*'));
+      const favKeys: string[] = await withRetry(() =>
+        this.client.keys('u:*:fav:*')
+      );
       if (favKeys.length > 0) {
         const oldFavKeys = favKeys.filter((k) => {
           const parts = k.split(':');
@@ -414,7 +630,9 @@ export class UpstashRedisStorage implements IStorage {
       }
 
       // 迁移 skipConfig：u:*:skip:* → u:username:skip (Hash)
-      const skipKeys: string[] = await withRetry(() => this.client.keys('u:*:skip:*'));
+      const skipKeys: string[] = await withRetry(() =>
+        this.client.keys('u:*:skip:*')
+      );
       if (skipKeys.length > 0) {
         const oldSkipKeys = skipKeys.filter((k) => {
           const parts = k.split(':');
@@ -439,9 +657,13 @@ export class UpstashRedisStorage implements IStorage {
       }
 
       // 迁移用户列表：从 KEYS u:*:pwd 构建 sys:users Set
-      const userSetExists = await withRetry(() => this.client.exists(this.usersSetKey()));
+      const userSetExists = await withRetry(() =>
+        this.client.exists(this.usersSetKey())
+      );
       if (!userSetExists) {
-        const pwdKeys: string[] = await withRetry(() => this.client.keys('u:*:pwd'));
+        const pwdKeys: string[] = await withRetry(() =>
+          this.client.keys('u:*:pwd')
+        );
         const userNames = pwdKeys
           .map((k) => {
             const match = k.match(/^u:(.+?):pwd$/);
@@ -449,7 +671,9 @@ export class UpstashRedisStorage implements IStorage {
           })
           .filter((u): u is string => typeof u === 'string');
         if (userNames.length > 0) {
-          await withRetry(() => this.client.sadd(this.usersSetKey(), userNames));
+          await withRetry(() =>
+            this.client.sadd(this.usersSetKey(), userNames)
+          );
           console.log(`迁移了 ${userNames.length} 个用户到 Set`);
         }
       }
@@ -468,13 +692,17 @@ export class UpstashRedisStorage implements IStorage {
   }
 
   async migratePasswords(): Promise<void> {
-    const migrated = await withRetry(() => this.client.get(this.pwdMigrationKey()));
+    const migrated = await withRetry(() =>
+      this.client.get(this.pwdMigrationKey())
+    );
     if (migrated === 'done') return;
 
     console.log('开始密码迁移：明文 → 加盐哈希...');
 
     try {
-      const pwdKeys: string[] = await withRetry(() => this.client.keys('u:*:pwd'));
+      const pwdKeys: string[] = await withRetry(() =>
+        this.client.keys('u:*:pwd')
+      );
       let count = 0;
 
       for (const key of pwdKeys) {
@@ -485,8 +713,10 @@ export class UpstashRedisStorage implements IStorage {
         if (isHashed(storedStr)) continue;
         // 将明文密码转为加盐哈希
         const hashed = hashPassword(storedStr);
-        await withRetry(() => this.client.set(key, hashed));
-        count++;
+        const result = await withRetry(() =>
+          this.client.eval(MIGRATE_PASSWORD_SCRIPT, [key], [storedStr, hashed])
+        );
+        if (result === 'UPDATED') count++;
       }
 
       await withRetry(() => this.client.set(this.pwdMigrationKey(), 'done'));
@@ -507,8 +737,10 @@ export class UpstashRedisStorage implements IStorage {
         await this.deleteUser(username);
       }
 
-      // 删除管理员配置
-      await withRetry(() => this.client.del(this.adminConfigKey()));
+      // 删除管理员配置及版本
+      await withRetry(() =>
+        this.client.del(this.adminConfigKey(), ADMIN_CONFIG_VERSION_KEY)
+      );
 
       console.log('所有数据已清空');
     } catch (error) {

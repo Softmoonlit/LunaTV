@@ -3,8 +3,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 import { getAuthInfoFromCookie } from '@/lib/auth';
-import { getConfig } from '@/lib/config';
-import { db } from '@/lib/db';
+import { getConfig, saveConfig } from '@/lib/config';
 import { refreshLiveChannels } from '@/lib/live';
 
 export const runtime = 'nodejs';
@@ -17,9 +16,7 @@ export async function POST(request: NextRequest) {
     const config = await getConfig();
     if (username !== process.env.USERNAME) {
       // 管理员
-      const user = config.UserConfig.Users.find(
-        (u) => u.username === username
-      );
+      const user = config.UserConfig.Users.find((u) => u.username === username);
       if (!user || user.role !== 'admin' || user.banned) {
         return NextResponse.json({ error: '权限不足' }, { status: 401 });
       }
@@ -27,7 +24,7 @@ export async function POST(request: NextRequest) {
 
     // 并发刷新所有启用的直播源
     const refreshPromises = (config.LiveConfig || [])
-      .filter(liveInfo => !liveInfo.disabled)
+      .filter((liveInfo) => !liveInfo.disabled)
       .map(async (liveInfo) => {
         try {
           const nums = await refreshLiveChannels(liveInfo);
@@ -41,7 +38,7 @@ export async function POST(request: NextRequest) {
     await Promise.all(refreshPromises);
 
     // 保存配置
-    await db.saveAdminConfig(config);
+    await saveConfig(config);
 
     return NextResponse.json({
       success: true,

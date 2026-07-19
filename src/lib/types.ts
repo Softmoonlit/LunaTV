@@ -7,6 +7,41 @@ export class UserAlreadyExistsError extends Error {
   }
 }
 
+export class ConfigConflictError extends Error {
+  constructor() {
+    super('配置已被其他请求更新');
+    this.name = 'ConfigConflictError';
+  }
+}
+
+export type AtomicRegistrationResult =
+  | { outcome: 'created'; config: AdminConfig; replayed: boolean }
+  | { outcome: 'already_exists' }
+  | { outcome: 'registration_disabled' }
+  | { outcome: 'idempotency_conflict' };
+
+export interface AtomicRegistrationInput {
+  username: string;
+  passwordHash: string;
+  ownerUsername: string;
+  operationId: string;
+  requestFingerprint: string;
+}
+
+interface AtomicUserMutationBase {
+  username: string;
+  config: AdminConfig;
+}
+
+export type AtomicUserMutationInput =
+  | (AtomicUserMutationBase & {
+      action: 'add' | 'changePassword';
+      passwordHash: string;
+    })
+  | (AtomicUserMutationBase & {
+      action: 'delete';
+    });
+
 // 播放记录数据结构
 export interface PlayRecord {
   title: string;
@@ -55,6 +90,11 @@ export interface IStorage {
 
   // 用户相关
   registerUser(userName: string, password: string): Promise<void>;
+  restoreUserPassword(userName: string, storedPassword: string): Promise<void>;
+  registerUserAtomically(
+    input: AtomicRegistrationInput
+  ): Promise<AtomicRegistrationResult>;
+  mutateUserAtomically(input: AtomicUserMutationInput): Promise<AdminConfig>;
   verifyUser(userName: string, password: string): Promise<boolean>;
   // 检查用户是否存在（无需密码）
   checkUserExist(userName: string): Promise<boolean>;
@@ -73,7 +113,10 @@ export interface IStorage {
 
   // 管理员配置相关
   getAdminConfig(): Promise<AdminConfig | null>;
-  setAdminConfig(config: AdminConfig): Promise<void>;
+  getAdminConfigVersion(): Promise<number>;
+  initializeAdminConfig(config: AdminConfig): Promise<AdminConfig>;
+  setAdminConfig(config: AdminConfig): Promise<AdminConfig>;
+  replaceAdminConfig(config: AdminConfig): Promise<AdminConfig>;
 
   // 跳过片头片尾配置相关
   getSkipConfig(
