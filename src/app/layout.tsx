@@ -46,7 +46,8 @@ export default async function RootLayout({
     process.env.ANNOUNCEMENT ||
     '本网站仅提供影视信息搜索服务，所有内容均来自第三方网站。本站不存储任何视频资源，不对任何内容的准确性、合法性、完整性负责。';
 
-  let doubanProxyType = process.env.NEXT_PUBLIC_DOUBAN_PROXY_TYPE || 'cmliussss-cdn-tencent';
+  let doubanProxyType =
+    process.env.NEXT_PUBLIC_DOUBAN_PROXY_TYPE || 'cmliussss-cdn-tencent';
   let doubanProxy = process.env.NEXT_PUBLIC_DOUBAN_PROXY || '';
   let doubanImageProxyType =
     process.env.NEXT_PUBLIC_DOUBAN_IMAGE_PROXY_TYPE || 'cmliussss-cdn-tencent';
@@ -71,13 +72,16 @@ export default async function RootLayout({
     doubanImageProxyType = config.SiteConfig.DoubanImageProxyType;
     doubanImageProxy = config.SiteConfig.DoubanImageProxy;
     disableYellowFilter = config.SiteConfig.DisableYellowFilter;
-    customCategories = config.CustomCategories.filter(
-      (category) => !category.disabled
-    ).map((category) => ({
-      name: category.name || '',
-      type: category.type,
-      query: category.query,
-    }));
+    const configuredCategories = Array.isArray(config.CustomCategories)
+      ? config.CustomCategories
+      : [];
+    customCategories = configuredCategories
+      .filter((category) => !category.disabled)
+      .map((category) => ({
+        name: category.name || '',
+        type: category.type,
+        query: category.query,
+      }));
     fluidSearch = config.SiteConfig.FluidSearch;
     enableRegister = config.UserConfig.AllowRegister;
     enableWebLive = config.SiteConfig.EnableWebLive ?? false;

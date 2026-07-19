@@ -84,7 +84,7 @@ return 'OK'
 export const REPLACE_ADMIN_CONFIG_SCRIPT = `
 local operationRaw = redis.call('GET', KEYS[3])
 if operationRaw then
-  return 'OK'
+  return {'OK'}
 end
 
 local currentRaw = redis.call('GET', KEYS[1])
@@ -94,13 +94,18 @@ if currentRaw then
   currentVersion = tonumber(current.ConfigVersion) or 0
 end
 
-local replacement = cjson.decode(ARGV[1])
-replacement.ConfigVersion = currentVersion + 1
-local replacementRaw = cjson.encode(replacement)
+local expectedVersion = tonumber(ARGV[1])
+if currentVersion ~= expectedVersion then return {'CONFLICT'} end
+
+local replacementRaw = ARGV[2]
+local replacement = cjson.decode(replacementRaw)
+local replacementVersion = tonumber(replacement.ConfigVersion) or 0
+if replacementVersion ~= expectedVersion + 1 then return {'INVALID_CONFIG'} end
+
 redis.call('SET', KEYS[1], replacementRaw)
-redis.call('SET', KEYS[2], tostring(replacement.ConfigVersion))
-redis.call('SET', KEYS[3], '1', 'EX', tonumber(ARGV[2]))
-return 'OK'
+redis.call('SET', KEYS[2], tostring(replacementVersion))
+redis.call('SET', KEYS[3], '1', 'EX', tonumber(ARGV[3]))
+return {'OK'}
 `;
 
 export const MUTATE_USER_SCRIPT = `
@@ -129,8 +134,10 @@ local current = cjson.decode(currentRaw)
 local currentVersion = tonumber(current.ConfigVersion) or 0
 if currentVersion ~= tonumber(ARGV[1]) then return {'CONFLICT'} end
 
-local target = cjson.decode(ARGV[2])
-local targetRaw = cjson.encode(target)
+local targetRaw = ARGV[2]
+local target = cjson.decode(targetRaw)
+local targetVersion = tonumber(target.ConfigVersion) or 0
+if targetVersion ~= currentVersion + 1 then return {'INVALID_CONFIG'} end
 local action = ARGV[3]
 
 if action == 'add' or action == 'changePassword' then
@@ -205,15 +212,27 @@ end
 if redis.call('EXISTS', KEYS[3]) == 1 then return {'USER_EXISTS'} end
 
 local currentVersion = tonumber(config.ConfigVersion) or 0
-config.ConfigVersion = currentVersion + 1
-table.insert(config.UserConfig.Users, {username = ARGV[1], role = 'user'})
-local updatedConfigRaw = cjson.encode(config)
+if currentVersion ~= tonumber(ARGV[6]) then return {'CONFLICT'} end
+
+local targetRaw = ARGV[7]
+local target = cjson.decode(targetRaw)
+local targetVersion = tonumber(target.ConfigVersion) or 0
+if targetVersion ~= currentVersion + 1 then return {'INVALID_CONFIG'} end
+if type(target.UserConfig) ~= 'table' or type(target.UserConfig.Users) ~= 'table' then
+  return {'INVALID_CONFIG'}
+end
+local targetUserExists = false
+for _, user in ipairs(target.UserConfig.Users) do
+  if user.username == ARGV[1] then targetUserExists = true end
+end
+if not targetUserExists then return {'INVALID_CONFIG'} end
+
 local operationRawToSave = cjson.encode({fingerprint = ARGV[5]})
 
 redis.call('SET', KEYS[3], ARGV[3])
 redis.call('SADD', KEYS[4], ARGV[1])
 redis.call('SET', KEYS[5], operationRawToSave, 'EX', tonumber(ARGV[4]))
-redis.call('SET', KEYS[1], updatedConfigRaw)
-redis.call('SET', KEYS[2], tostring(config.ConfigVersion))
+redis.call('SET', KEYS[1], targetRaw)
+redis.call('SET', KEYS[2], tostring(targetVersion))
 return {'CREATED', '0'}
 `;

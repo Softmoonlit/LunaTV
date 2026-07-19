@@ -7,6 +7,8 @@ import { BaseRedisStorage } from './redis-base.db';
 import {
   MIGRATE_PASSWORD_SCRIPT,
   MUTATE_USER_SCRIPT,
+  REGISTER_USER_SCRIPT,
+  REPLACE_ADMIN_CONFIG_SCRIPT,
   RESTORE_USER_PASSWORD_SCRIPT,
 } from './storage-scripts';
 import { ConfigConflictError } from './types';
@@ -125,6 +127,67 @@ describe('原子用户存储适配器协议', () => {
       'member',
       '300',
     ]);
+    const targetConfig = JSON.parse(options.arguments[1]);
+    expect(targetConfig.SourceConfig).toEqual([]);
+    expect(targetConfig.CustomCategories).toEqual([]);
+    expect(targetConfig.LiveConfig).toEqual([]);
+  });
+
+  it('Redis 注册冲突后基于最新配置重建目标 JSON', async () => {
+    const initialConfig = createConfig();
+    const latestConfig = { ...createConfig(), ConfigVersion: 5 };
+    const savedConfig = {
+      ...latestConfig,
+      ConfigVersion: 6,
+      UserConfig: {
+        ...latestConfig.UserConfig,
+        Users: [
+          ...latestConfig.UserConfig.Users,
+          { username: 'new-user', role: 'user' as const },
+        ],
+      },
+    };
+    const client = {
+      eval: jest
+        .fn()
+        .mockResolvedValueOnce(['CONFLICT'])
+        .mockResolvedValueOnce(['CREATED', '0']),
+      get: jest
+        .fn()
+        .mockResolvedValueOnce(JSON.stringify(initialConfig))
+        .mockResolvedValueOnce(JSON.stringify(latestConfig))
+        .mockResolvedValueOnce(JSON.stringify(savedConfig)),
+    };
+    const storage = new TestRedisStorage(client);
+
+    await expect(
+      storage.registerUserAtomically({
+        username: 'new-user',
+        ownerUsername: 'owner',
+        passwordHash: 'hashed-password',
+        operationId: 'operation-id',
+        requestFingerprint: 'fingerprint',
+      })
+    ).resolves.toEqual({
+      outcome: 'created',
+      replayed: false,
+      config: savedConfig,
+    });
+
+    const firstOptions = client.eval.mock.calls[0][1];
+    const secondOptions = client.eval.mock.calls[1][1];
+    expect(client.eval.mock.calls[0][0]).toBe(REGISTER_USER_SCRIPT);
+    expect(firstOptions.keys[4]).toBe('registration:operation:operation-id');
+    expect(secondOptions.keys[4]).toBe('registration:operation:operation-id');
+    expect(firstOptions.arguments[5]).toBe('4');
+    expect(secondOptions.arguments[5]).toBe('5');
+    const targetConfig = JSON.parse(secondOptions.arguments[6]);
+    expect(targetConfig.ConfigVersion).toBe(6);
+    expect(targetConfig.CustomCategories).toEqual([]);
+    expect(targetConfig.UserConfig.Users).toContainEqual({
+      username: 'new-user',
+      role: 'user',
+    });
   });
 
   it('Redis 将配置版本冲突映射为 ConfigConflictError', async () => {
@@ -193,6 +256,42 @@ describe('原子用户存储适配器协议', () => {
       'new-user',
       '300',
     ]);
+  });
+
+  it('Upstash 整体替换冲突后保留操作键并原样传递空数组', async () => {
+    const initialConfig = createConfig();
+    const latestConfig = { ...createConfig(), ConfigVersion: 5 };
+    const savedConfig = { ...createConfig(), ConfigVersion: 6 };
+    const client = {
+      eval: jest
+        .fn()
+        .mockResolvedValueOnce(['CONFLICT'])
+        .mockResolvedValueOnce(['OK']),
+      get: jest
+        .fn()
+        .mockResolvedValueOnce(initialConfig)
+        .mockResolvedValueOnce(latestConfig)
+        .mockResolvedValueOnce(savedConfig),
+    };
+    (global as any)[Symbol.for('__MOONTV_UPSTASH_REDIS_CLIENT__')] = client;
+    const storage = new UpstashRedisStorage();
+
+    await expect(storage.replaceAdminConfig(createConfig())).resolves.toEqual(
+      savedConfig
+    );
+
+    const [firstScript, firstKeys, firstArgs] = client.eval.mock.calls[0];
+    const [, secondKeys, secondArgs] = client.eval.mock.calls[1];
+    expect(firstScript).toBe(REPLACE_ADMIN_CONFIG_SCRIPT);
+    expect(firstKeys[2]).toMatch(/^config:operation:/);
+    expect(secondKeys[2]).toBe(firstKeys[2]);
+    expect(firstArgs[0]).toBe('4');
+    expect(secondArgs[0]).toBe('5');
+    const targetConfig = JSON.parse(secondArgs[1]);
+    expect(targetConfig.ConfigVersion).toBe(6);
+    expect(targetConfig.SourceConfig).toEqual([]);
+    expect(targetConfig.CustomCategories).toEqual([]);
+    expect(targetConfig.LiveConfig).toEqual([]);
   });
 
   it('Upstash 将配置版本冲突映射为 ConfigConflictError', async () => {

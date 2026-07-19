@@ -17,8 +17,9 @@ describe('存储原子脚本协议', () => {
       "redis.call('SADD', KEYS[4], ARGV[1])"
     );
     expect(REGISTER_USER_SCRIPT).toContain(
-      "redis.call('SET', KEYS[1], updatedConfigRaw)"
+      "redis.call('SET', KEYS[1], targetRaw)"
     );
+    expect(REGISTER_USER_SCRIPT).not.toContain('cjson.encode(config)');
   });
 
   it('注册支持同一幂等操作的安全重放', () => {
@@ -45,6 +46,11 @@ describe('存储原子脚本协议', () => {
     expect(MUTATE_USER_SCRIPT).toContain(
       "redis.call('SET', KEYS[9], '1', 'EX', tonumber(ARGV[6]))"
     );
+  });
+
+  it('后台用户操作原样写入目标配置，避免空数组变成对象', () => {
+    expect(MUTATE_USER_SCRIPT).toContain('local targetRaw = ARGV[2]');
+    expect(MUTATE_USER_SCRIPT).not.toContain('cjson.encode(target)');
   });
 
   it('后台用户操作在任何写入前检查全部关键 key 类型', () => {
@@ -104,12 +110,21 @@ describe('存储原子脚本协议', () => {
     );
   });
 
-  it('整体替换支持响应丢失后的幂等重试', () => {
+  it('整体替换支持响应丢失后的幂等重试并原样写入配置', () => {
     expect(REPLACE_ADMIN_CONFIG_SCRIPT).toContain(
       "local operationRaw = redis.call('GET', KEYS[3])"
     );
     expect(REPLACE_ADMIN_CONFIG_SCRIPT).toContain(
-      "redis.call('SET', KEYS[3], '1', 'EX', tonumber(ARGV[2]))"
+      'currentVersion ~= expectedVersion'
+    );
+    expect(REPLACE_ADMIN_CONFIG_SCRIPT).toContain(
+      "redis.call('SET', KEYS[1], replacementRaw)"
+    );
+    expect(REPLACE_ADMIN_CONFIG_SCRIPT).not.toContain(
+      'cjson.encode(replacement)'
+    );
+    expect(REPLACE_ADMIN_CONFIG_SCRIPT).toContain(
+      "redis.call('SET', KEYS[3], '1', 'EX', tonumber(ARGV[3]))"
     );
   });
 });

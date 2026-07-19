@@ -61,6 +61,22 @@ describe('configSelfCheck', () => {
     expect(config.ConfigVersion).toBe(7);
   });
 
+  it('缓存配置时修复错误的自定义分类类型并隔离原对象', async () => {
+    process.env.NEXT_PUBLIC_STORAGE_TYPE = 'redis';
+    const malformed = createConfig(true);
+    malformed.ConfigVersion = 10;
+    malformed.CustomCategories = {} as AdminConfig['CustomCategories'];
+
+    await setCachedConfig(malformed);
+    malformed.UserConfig.AllowRegister = false;
+    mockedGetConfigVersion.mockResolvedValueOnce(10);
+
+    const result = await getConfig();
+
+    expect(result.CustomCategories).toEqual([]);
+    expect(result.UserConfig.AllowRegister).toBe(true);
+  });
+
   it('配置版本探测失败时返回缓存副本', async () => {
     process.env.NEXT_PUBLIC_STORAGE_TYPE = 'redis';
     const cached = createConfig(true);
@@ -71,8 +87,9 @@ describe('configSelfCheck', () => {
 
     const result = await getConfig();
 
-    expect(result).toEqual(cached);
+    expect(result).toEqual(configSelfCheck(JSON.parse(JSON.stringify(cached))));
     expect(result).not.toBe(cached);
+    expect(cached.UserConfig.Users).toEqual([]);
     expect(mockedGetAdminConfig).not.toHaveBeenCalled();
     expect(consoleError).toHaveBeenCalledWith(
       '获取配置版本失败:',

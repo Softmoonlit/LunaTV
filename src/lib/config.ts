@@ -337,7 +337,10 @@ export async function getConfig(): Promise<AdminConfig> {
         adminConfig = await db.saveAdminConfig(adminConfig);
       } catch (error) {
         if (error instanceof ConfigConflictError) {
-          adminConfig = (await db.getAdminConfig()) || adminConfig;
+          const latestConfig = await db.getAdminConfig();
+          adminConfig = latestConfig
+            ? configSelfCheck(latestConfig)
+            : adminConfig;
         } else {
           throw error;
         }
@@ -538,5 +541,5 @@ export async function getAvailableApiSites(user?: string): Promise<ApiSite[]> {
 }
 
 export async function setCachedConfig(config: AdminConfig) {
-  cachedConfig = config;
+  cachedConfig = configSelfCheck(cloneConfig(config));
 }

@@ -250,30 +250,52 @@ export class UpstashRedisStorage implements IStorage {
   async registerUserAtomically(
     input: AtomicRegistrationInput
   ): Promise<AtomicRegistrationResult> {
-    const result = await withRetry(() =>
-      this.client.eval(
-        REGISTER_USER_SCRIPT,
-        [
-          ADMIN_CONFIG_KEY,
-          ADMIN_CONFIG_VERSION_KEY,
-          this.userPwdKey(input.username),
-          USERS_SET_KEY,
-          `registration:operation:${input.operationId}`,
-        ],
-        [
-          input.username,
-          input.ownerUsername,
-          input.passwordHash,
-          String(24 * 60 * 60),
-          input.requestFingerprint,
-        ]
-      )
-    );
-    const parsed = parseRegistrationResult(result);
-    if (parsed.outcome !== 'created') return parsed;
-    const config = await this.getAdminConfig();
-    if (!config) throw new Error('注册完成后无法读取配置');
-    return { ...parsed, config };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const currentConfig = await this.getAdminConfig();
+      if (!currentConfig) throw new Error('注册前无法读取配置');
+      const expectedVersion = currentConfig.ConfigVersion || 0;
+      const targetConfig = {
+        ...currentConfig,
+        ConfigVersion: expectedVersion + 1,
+        UserConfig: {
+          ...currentConfig.UserConfig,
+          Users: [
+            ...currentConfig.UserConfig.Users,
+            { username: input.username, role: 'user' as const },
+          ],
+        },
+      };
+      const result = ensureStringArray(
+        (await withRetry(() =>
+          this.client.eval(
+            REGISTER_USER_SCRIPT,
+            [
+              ADMIN_CONFIG_KEY,
+              ADMIN_CONFIG_VERSION_KEY,
+              this.userPwdKey(input.username),
+              USERS_SET_KEY,
+              `registration:operation:${input.operationId}`,
+            ],
+            [
+              input.username,
+              input.ownerUsername,
+              input.passwordHash,
+              String(24 * 60 * 60),
+              input.requestFingerprint,
+              String(expectedVersion),
+              JSON.stringify(targetConfig),
+            ]
+          )
+        )) as any[]
+      );
+      if (result[0] === 'CONFLICT') continue;
+      const parsed = parseRegistrationResult(result);
+      if (parsed.outcome !== 'created') return parsed;
+      const config = await this.getAdminConfig();
+      if (!config) throw new Error('注册完成后无法读取配置');
+      return { ...parsed, config };
+    }
+    throw new ConfigConflictError();
   }
 
   async mutateUserAtomically(
@@ -485,20 +507,36 @@ export class UpstashRedisStorage implements IStorage {
 
   async replaceAdminConfig(config: AdminConfig): Promise<AdminConfig> {
     const operationId = randomUUID();
-    await withRetry(() =>
-      this.client.eval(
-        REPLACE_ADMIN_CONFIG_SCRIPT,
-        [
-          ADMIN_CONFIG_KEY,
-          ADMIN_CONFIG_VERSION_KEY,
-          `config:operation:${operationId}`,
-        ],
-        [JSON.stringify(config), String(5 * 60)]
-      )
-    );
-    const savedConfig = await this.getAdminConfig();
-    if (!savedConfig) throw new Error('替换后无法读取配置');
-    return savedConfig;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const currentConfig = await this.getAdminConfig();
+      const expectedVersion = currentConfig?.ConfigVersion || 0;
+      const nextConfig = { ...config, ConfigVersion: expectedVersion + 1 };
+      const result = ensureStringArray(
+        (await withRetry(() =>
+          this.client.eval(
+            REPLACE_ADMIN_CONFIG_SCRIPT,
+            [
+              ADMIN_CONFIG_KEY,
+              ADMIN_CONFIG_VERSION_KEY,
+              `config:operation:${operationId}`,
+            ],
+            [
+              String(expectedVersion),
+              JSON.stringify(nextConfig),
+              String(5 * 60),
+            ]
+          )
+        )) as any[]
+      );
+      if (result[0] === 'CONFLICT') continue;
+      if (result[0] !== 'OK') {
+        throw new Error(`替换配置失败: ${result[0] || 'UNKNOWN'}`);
+      }
+      const savedConfig = await this.getAdminConfig();
+      if (!savedConfig) throw new Error('替换后无法读取配置');
+      return savedConfig;
+    }
+    throw new ConfigConflictError();
   }
 
   // ---------- 跳过片头片尾配置 ----------
