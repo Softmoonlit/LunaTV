@@ -1,39 +1,45 @@
-version: '3.8'
-
 services:
+  lunatv:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lunatv
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      # 部署前必须修改站长账号和密码
+      USERNAME: admin
+      PASSWORD: change_this_password
+      NEXT_PUBLIC_STORAGE_TYPE: redis
+      REDIS_URL: redis://redis:6379
+      NEXT_PUBLIC_SITE_NAME: LunaTV
+      # 仅控制首次初始化，之后请在管理后台修改注册开关
+      NEXT_PUBLIC_ENABLE_REGISTER: 'false'
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - lunatv-network
+
   redis:
     image: redis:7-alpine
     container_name: lunatv-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - lunatv-network
 
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: lunatv-app
-    ports:
-      - '3000:3000'
-    depends_on:
-      redis:
-        condition: service_healthy
-    environment:
-      # 存储类型：使用 redis
-      - NEXT_PUBLIC_STORAGE_TYPE=redis
-      # Redis 连接地址（容器内通过 service name 访问）
-      - REDIS_URL=redis://redis:6379
-      # 站长账号
-      - USERNAME=admin
-      # 站长密码
-      - PASSWORD=admin123
-      # 站点名称（可选）
-      - NEXT_PUBLIC_SITE_NAME=MoonTV
+networks:
+  lunatv-network:
+    driver: bridge
 
 volumes:
   redis-data:
