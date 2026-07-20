@@ -6,6 +6,7 @@ import { ChevronRight } from 'lucide-react';
 import Link from 'next/link';
 import { Suspense, useEffect, useState } from 'react';
 
+import { getBangumiPoster } from '@/lib/bangumi';
 import {
   BangumiCalendarData,
   GetBangumiCalendarData,
@@ -392,13 +393,7 @@ function HomeClient() {
                           <VideoCard
                             from='douban'
                             title={anime.name_cn || anime.name}
-                            poster={
-                              anime.images.large ||
-                              anime.images.common ||
-                              anime.images.medium ||
-                              anime.images.small ||
-                              anime.images.grid
-                            }
+                            poster={getBangumiPoster(anime)}
                             douban_id={anime.id}
                             rate={anime.rating?.score?.toFixed(1) || ''}
                             year={anime.air_date?.split('-')?.[0] || ''}

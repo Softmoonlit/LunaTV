@@ -2,6 +2,8 @@
 import he from 'he';
 import Hls from 'hls.js';
 
+import { getBangumiImageUrl } from './bangumi';
+
 function getDoubanImageProxyConfig(): {
   proxyType:
   | 'server'
@@ -33,6 +35,10 @@ function getDoubanImageProxyConfig(): {
  */
 export function processImageUrl(originalUrl: string): string {
   if (!originalUrl) return originalUrl;
+
+  if (getBangumiImageUrl(originalUrl)) {
+    return `/api/bangumi/image?url=${encodeURIComponent(originalUrl)}`;
+  }
 
   // 仅处理豆瓣图片代理
   if (!originalUrl.includes('doubanio.com')) {
